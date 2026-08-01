@@ -1,0 +1,12 @@
+node_modules/
+venv/
+backend/data/*.csv
+mlruns/
+venv2/
+backend/venv/
+backend/venv2/
+__pycache__/
+.env
+dist/
+build/
+*.pyc

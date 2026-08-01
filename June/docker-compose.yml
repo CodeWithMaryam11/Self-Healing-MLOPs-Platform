@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: pipelineiq_fastapi_backend
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - JWT_SECRET=jwt_token_fastapi_production_secret_881920
+      - MONGO_URL=mongodb://mongodb:27017
+      - MINIO_URL=http://minio:9000
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+    depends_on:
+      - mongodb
+      - minio
+    volumes:
+      - ./backend:/app
+    restart: always
+
+  mongodb:
+    image: mongo:6.0
+    container_name: pipelineiq_mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    restart: always
+
+  minio:
+    image: minio/minio
+    container_name: pipelineiq_minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    restart: always
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pipelineiq_react_frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_BASE_URL=http://localhost:8000/api/v1
+      - VITE_USE_MOCK=false
+    depends_on:
+      - backend
+    volumes:
+      - .:/app
+      - /app/node_modules
+    restart: always
+
+networks:
+  default:
+    name: pipelineiq_network
+
+volumes:
+  mongo_data:
+  minio_data:
