@@ -30,18 +30,22 @@ def ensure_bucket_exists():
 
 def upload_dataset_to_s3(user_id: str, filename: str, file_bytes: bytes) -> str:
     """Uploads a user's dataset to MinIO/S3 and returns the S3 object key."""
-    ensure_bucket_exists()
+    import socket
+    from urllib.parse import urlparse
+    parsed = urlparse(MINIO_URL)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 9000
     
-    # Store it under the user's isolated folder
-    object_key = f"{user_id}/{filename}"
-    
-    s3_client.upload_fileobj(
-        BytesIO(file_bytes),
-        DATASETS_BUCKET,
-        object_key
-    )
-    
-    return object_key
+    # Fast check if MinIO is listening
+    with socket.create_connection((host, port), timeout=0.5):
+        ensure_bucket_exists()
+        object_key = f"{user_id}/{filename}"
+        s3_client.upload_fileobj(
+            BytesIO(file_bytes),
+            DATASETS_BUCKET,
+            object_key
+        )
+        return object_key
 
 def download_dataset_from_s3(object_key: str) -> bytes:
     """Downloads a dataset from MinIO/S3 into memory."""

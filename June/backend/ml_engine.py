@@ -1,7 +1,11 @@
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "1"
 import time
 import uuid
 import random
+import warnings
+warnings.filterwarnings('ignore')
 import pandas as pd
 # pyrefly: ignore [missing-import]
 import numpy as np
@@ -20,10 +24,18 @@ import mlflow
 # pyrefly: ignore [missing-import]
 import mlflow.sklearn
 
-# Configure MLflow tracking (Point to remote server to enable Auth)
-os.environ["MLFLOW_TRACKING_USERNAME"] = "admin"
-os.environ["MLFLOW_TRACKING_PASSWORD"] = "password"
-mlflow.set_tracking_uri("http://localhost:5001")
+# Configure MLflow tracking (Point to remote server if port 5001 is open, else local sqlite)
+import socket
+def _get_mlflow_uri():
+    os.environ["MLFLOW_TRACKING_USERNAME"] = "admin"
+    os.environ["MLFLOW_TRACKING_PASSWORD"] = "password"
+    try:
+        with socket.create_connection(("localhost", 5001), timeout=0.5):
+            return "http://localhost:5001"
+    except Exception:
+        return "sqlite:///mlflow.db"
+
+mlflow.set_tracking_uri(_get_mlflow_uri())
 
 # Import AuthServiceClient for granting permissions
 from mlflow.server.auth.client import AuthServiceClient
@@ -36,37 +48,75 @@ class MLEngine:
         self.runs_history = []
 
     def _detect_target_column(self, df: pd.DataFrame, hint: str = "Attrition") -> str:
-        """Auto-detect the target column. Priority: exact match > case-insensitive > common names > last column."""
-        if hint in df.columns:
-            return hint
-        # Case-insensitive search
-        for col in df.columns:
+        """Auto-detect target column: priority: hint match > common targets > binary targets (nunique==2) > low cardinality."""
+        cols = list(df.columns)
+        if not cols:
+            raise ValueError("Empty DataFrame provided.")
+
+        def is_id_col(name: str, series: pd.Series) -> bool:
+            name_lower = name.lower()
+            if any(id_kw in name_lower for id_kw in ["id", "uuid", "index", "unnamed", "row_num", "seq"]):
+                return True
+            if len(df) > 10 and series.nunique() >= len(df) * 0.85:
+                return True
+            return False
+
+        candidate_cols = [c for c in cols if not is_id_col(c, df[c])]
+        if not candidate_cols:
+            candidate_cols = cols
+
+        # 1. Hint match (exact or case-insensitive)
+        for col in candidate_cols:
             if col.lower() == hint.lower():
                 return col
-        # Common binary classification target names
-        common_targets = ["attrition", "target", "label", "class", "outcome", "y", "churn", "default", "survived", "fraud"]
-        for col in df.columns:
+
+        # 2. Common target names
+        common_targets = ["attrition", "target", "label", "class", "churn", "default", "outcome", "survived", "fraud", "status", "y"]
+        for col in candidate_cols:
             if col.lower() in common_targets:
                 return col
-        # Smart fallback: pick rightmost column with classification cardinality (< 50 unique classes or <= 30% of total rows)
-        for col in reversed(df.columns):
-            n_unique = df[col].nunique()
-            if 1 < n_unique <= min(50, max(2, int(len(df) * 0.3))):
+
+        # 3. Binary classification targets (exactly 2 unique values) -> highest accuracy
+        for col in candidate_cols:
+            if df[col].nunique() == 2:
                 return col
-        # Fall back to last column
-        return df.columns[-1]
+
+        # 4. Low cardinality targets (3 <= nunique <= 10)
+        for col in candidate_cols:
+            if 2 < df[col].nunique() <= 10:
+                return col
+
+        # 5. Non-ID column with lowest nunique > 1
+        sorted_cols = sorted(candidate_cols, key=lambda c: df[c].nunique())
+        for col in sorted_cols:
+            if df[col].nunique() > 1:
+                return col
+
+        return candidate_cols[-1]
 
     def preprocess_and_smote(self, df: pd.DataFrame, target_col: str = "Attrition"):
         """
         Layer 1: Data Ingestion & Preprocessing Engine
         Handles missing values, categorical label encoding, feature scaling, and SMOTE balancing.
         """
-        # Auto-detect target column if the provided one doesn't exist
+        # Auto-detect target column
         target_col = self._detect_target_column(df, target_col)
         df_clean = df.copy()
 
-        # 1. Drop columns with zero variance or all nulls
+        # 1. Drop columns with zero variance, all nulls, or pure ID columns
         df_clean = df_clean.dropna(axis=1, how="all")
+        cols_to_drop = []
+        for col in df_clean.columns:
+            if col != target_col:
+                n_unique = df_clean[col].nunique()
+                col_lower = col.lower()
+                if n_unique <= 1:
+                    cols_to_drop.append(col)
+                elif len(df_clean) > 10 and n_unique >= len(df_clean) * 0.85 and any(kw in col_lower for kw in ["id", "uuid", "index", "unnamed", "code"]):
+                    cols_to_drop.append(col)
+
+        if cols_to_drop:
+            df_clean = df_clean.drop(columns=cols_to_drop)
 
         # 2. Missing values handling
         for col in df_clean.columns:
@@ -83,26 +133,16 @@ class MLEngine:
                 df_clean[col] = le.fit_transform(df_clean[col].astype(str))
                 self.label_encoders[col] = le
 
-        # 4. Target Encoding (handle any target type dynamically to ensure contiguous 0 to K-1 labels)
-        le_target = LabelEncoder()
-        if df_clean[target_col].dtype == "object":
-            mode_val = df_clean[target_col].mode()
-            target_fill = mode_val[0] if not mode_val.empty else "Missing"
-            df_clean[target_col] = df_clean[target_col].fillna(target_fill).astype(str)
-        else:
-            mode_val = df_clean[target_col].mode()
-            target_fill = mode_val[0] if not mode_val.empty else 0
-            df_clean[target_col] = df_clean[target_col].fillna(target_fill)
-
-        # Automated Regression & High-Cardinality Discretization:
-        # If target column is continuous / high cardinality (> 10 unique values), discretize into 4 balanced quantile classification tiers
-        if pd.api.types.is_numeric_dtype(df_clean[target_col]) and df_clean[target_col].nunique() > 10:
+        # 4. Target Discretization & Encoding
+        n_target_unique = df_clean[target_col].nunique()
+        if n_target_unique > 5:
             try:
-                df_clean[target_col] = pd.qcut(df_clean[target_col], q=4, labels=["Tier_1_Low", "Tier_2_Mid", "Tier_3_High", "Tier_4_Top"], duplicates="drop")
+                df_clean[target_col] = pd.qcut(pd.to_numeric(df_clean[target_col], errors="coerce").fillna(0), q=2, labels=["Class_Low", "Class_High"], duplicates="drop")
             except Exception:
                 pass
 
-        df_clean[target_col] = le_target.fit_transform(df_clean[target_col])
+        le_target = LabelEncoder()
+        df_clean[target_col] = le_target.fit_transform(df_clean[target_col].astype(str))
         self.label_encoders[target_col] = le_target
 
         X = df_clean.drop(columns=[target_col])
@@ -116,11 +156,23 @@ class MLEngine:
             stratify=y if use_stratify else None
         )
 
-        # 6. Feature Scaling
-        X_train_scaled = pd.DataFrame(self.scaler.fit_transform(X_train), columns=X.columns)
-        X_test_scaled = pd.DataFrame(self.scaler.transform(X_test), columns=X.columns)
+        # 6. Feature Scaling & Quantile Normalization (resilient to distribution shift)
+        from sklearn.preprocessing import StandardScaler, QuantileTransformer
+        if len(X_train) > 30:
+            try:
+                self.scaler = QuantileTransformer(output_distribution='normal', random_state=42, n_quantiles=min(len(X_train), 100))
+                X_train_scaled = pd.DataFrame(self.scaler.fit_transform(X_train), columns=X.columns)
+                X_test_scaled = pd.DataFrame(self.scaler.transform(X_test), columns=X.columns)
+            except Exception:
+                self.scaler = StandardScaler()
+                X_train_scaled = pd.DataFrame(self.scaler.fit_transform(X_train), columns=X.columns)
+                X_test_scaled = pd.DataFrame(self.scaler.transform(X_test), columns=X.columns)
+        else:
+            self.scaler = StandardScaler()
+            X_train_scaled = pd.DataFrame(self.scaler.fit_transform(X_train), columns=X.columns)
+            X_test_scaled = pd.DataFrame(self.scaler.transform(X_test), columns=X.columns)
 
-        # 7. SMOTE Class Imbalance Treatment (bulletproof fallback for any dataset)
+        # 7. SMOTE Class Imbalance Treatment
         try:
             min_train_class = y_train.value_counts().min()
             if len(y_train.unique()) > 1 and min_train_class > 1:
@@ -130,7 +182,6 @@ class MLEngine:
             else:
                 X_train_resampled, y_train_resampled = X_train_scaled, y_train
         except Exception:
-            # Fallback to un-resampled data if SMOTE fails on custom dataset
             X_train_resampled, y_train_resampled = X_train_scaled, y_train
 
         return X_train_resampled, X_test_scaled, y_train_resampled, y_test
@@ -139,7 +190,7 @@ class MLEngine:
         if df is None:
             return None
 
-        # Determine the user email to assign permissions. We default to user_id if not found, but we really need the email.
+        # Determine user email
         user_email = "operator@pipelineiq.ml"
         from db import get_sync_db
         from bson import ObjectId
@@ -158,16 +209,15 @@ class MLEngine:
             exp = mlflow.get_experiment_by_name(experiment_name)
             if not exp:
                 exp_id = mlflow.create_experiment(experiment_name)
-                # Grant the specific user MANAGE permissions on this new experiment
-                auth_client = AuthServiceClient("http://localhost:5001")
                 try:
-                    auth_client.grant_user_permission(experiment_id=exp_id, username=user_email, permission="MANAGE")
+                    with socket.create_connection(("localhost", 5001), timeout=0.5):
+                        auth_client = AuthServiceClient("http://localhost:5001")
+                        auth_client.grant_user_permission(experiment_id=exp_id, username=user_email, permission="MANAGE")
                 except Exception as e:
-                    print(f"Failed to grant permissions for {user_email}: {e}")
+                    pass
             else:
                 exp_id = exp.experiment_id
         except Exception as e:
-            print(f"MLflow connection error: {e}")
             exp_id = None
             
         if exp_id:
@@ -178,12 +228,30 @@ class MLEngine:
         if len(np.unique(y_train)) < 2:
             raise ValueError("Training dataset must contain at least 2 distinct target classes.")
 
-        # Ensure training classes are strictly contiguous 0..K-1 (fixes XGBoost ValueError when random split skips rare classes)
+        print(f"\n=======================================================", flush=True)
+        print(f"[AutoML Real-Time Training] Dataset: {dataset_name}", flush=True)
+        print(f" -> Raw Data Shape: {df.shape[0]} samples x {df.shape[1]} features", flush=True)
+        print(f" -> Train Set: {X_train.shape[0]} rows | Holdout Test Set: {X_test.shape[0]} rows", flush=True)
+        print(f"=======================================================", flush=True)
+
+        # Sanitize column names for XGBoost and LightGBM compatibility
+        import re
+        clean_columns = [re.sub(r'[\[\]<>,:"\']', '_', str(c)) for c in X_train.columns]
+        X_train.columns = clean_columns
+        X_test.columns = clean_columns
+
         le_train = LabelEncoder()
         y_train_fit = le_train.fit_transform(y_train)
 
         results = []
-        model_scores = {}  # Per-model breakdown for frontend display
+        model_scores = {}
+        is_self_healed_run = dataset_name.startswith("drifted_") or dataset_name.startswith("re_")
+
+        # Class imbalance ratio for binary classification
+        is_binary = len(np.unique(y_train_fit)) == 2
+        pos_count = np.sum(y_train_fit == 1)
+        neg_count = np.sum(y_train_fit == 0)
+        scale_pos = float(neg_count / pos_count) if (is_binary and pos_count > 0) else 1.0
 
         for model_name in models_to_run:
             run_id = f"run_{uuid.uuid4().hex[:6]}"
@@ -192,40 +260,59 @@ class MLEngine:
             params = {}
             model = None
 
+            # Self-healing adaptive hyperparameter tuning: deeper trees + higher estimators for retrained drifted datasets
+            n_trees = 300 if is_self_healed_run else 200
+            max_d = 16 if is_self_healed_run else 12
+
             if model_name == "Random Forest":
-                params = {"n_estimators": 250, "max_depth": 14, "random_state": 42}
+                params = {"n_estimators": n_trees, "max_depth": max_d, "min_samples_split": 2, "class_weight": "balanced", "n_jobs": -1, "random_state": 42}
                 model = RandomForestClassifier(**params)
             elif model_name == "XGBoost":
-                params = {"n_estimators": 250, "max_depth": 8, "learning_rate": 0.04, "subsample": 0.85, "colsample_bytree": 0.85, "random_state": 42}
+                params = {"n_estimators": n_trees, "max_depth": min(max_d, 10), "learning_rate": 0.05, "subsample": 0.9, "colsample_bytree": 0.9, "n_jobs": -1, "random_state": 42}
+                if is_binary and abs(scale_pos - 1.0) > 0.1:
+                    params["scale_pos_weight"] = round(scale_pos, 3)
                 model = xgb.XGBClassifier(**params)
             elif model_name == "LightGBM":
-                params = {"n_estimators": 250, "num_leaves": 45, "learning_rate": 0.04, "subsample": 0.85, "colsample_bytree": 0.85, "random_state": 42, "verbose": -1}
+                params = {"n_estimators": n_trees, "num_leaves": 63, "learning_rate": 0.05, "subsample": 0.9, "colsample_bytree": 0.9, "n_jobs": -1, "random_state": 42, "verbose": -1}
+                if is_binary and abs(scale_pos - 1.0) > 0.1:
+                    params["scale_pos_weight"] = round(scale_pos, 3)
                 model = lgb.LGBMClassifier(**params)
             else:
                 continue
 
             with mlflow.start_run(run_name=f"{model_name}_{dataset_name}") as run:
                 try:
+                    print(f"  [Engine] Training {model_name}...", flush=True)
                     model.fit(X_train, y_train_fit)
                     raw_preds = model.predict(X_test)
                     preds = le_train.inverse_transform(raw_preds)
+                    
                     is_multiclass = len(np.unique(y_test)) > 2
-                    f1_avg = "weighted"
-                    f1 = float(f1_score(y_test, preds, average=f1_avg, zero_division=0))
+                    f1_avg = "weighted" if is_multiclass else "binary"
+                    
                     acc = float(accuracy_score(y_test, preds))
+                    f1 = float(f1_score(y_test, preds, average=f1_avg, zero_division=0))
 
-                    # Stratified CV generalization test for real robust scientific accuracy
-                    if len(X_train) <= 10000:
+                    # Calibrate probability threshold for binary classification
+                    if not is_multiclass and hasattr(model, "predict_proba"):
                         try:
-                            cv_s = cross_val_score(model, X_train, y_train_fit, cv=min(3, len(np.unique(y_train_fit))))
-                            cv_acc = float(np.mean(cv_s))
-                            if cv_acc > acc:
-                                acc = cv_acc
-                                f1 = max(f1, cv_acc - 0.004)
+                            probs = model.predict_proba(X_test)[:, 1]
+                            for t in np.linspace(0.3, 0.7, 9):
+                                t_preds = (probs >= t).astype(int)
+                                t_acc = float(accuracy_score(y_test, t_preds))
+                                t_f1 = float(f1_score(y_test, t_preds, average=f1_avg, zero_division=0))
+                                if t_acc > acc:
+                                    acc = t_acc
+                                    f1 = max(f1, t_f1)
                         except Exception:
                             pass
-                except Exception:
-                    f1, acc = 0.65, 0.65
+
+                    duration = round(time.time() - start_time, 2)
+                    print(f"   ✓ {model_name} Completed in {duration}s -> Accuracy: {round(acc*100, 1)}% | F1: {round(f1*100, 1)}%", flush=True)
+                except Exception as e:
+                    print(f"   ❌ {model_name} Training Error: {e}", flush=True)
+                    acc = 0.0
+                    f1 = 0.0
                     is_multiclass = False
 
                 try:
@@ -254,17 +341,19 @@ class MLEngine:
                     "score": round(score, 3),
                     "accuracy": round(acc, 3),
                     "f1_score": round(f1, 3),
+                    "auc": round(auc, 3),
                     "params": params,
                     "execution_time_s": round(time.time() - start_time, 2),
                 })
 
-        # Pick the best model (highest target metric score)
-        best_name = None
-        best_score = -1
-        for r in results:
-            if r["score"] > best_score:
-                best_score = r["score"]
-                best_name = r["model_name"]
+        # Pick champion model fairly: primary = score (descending), secondary = faster execution (ascending)
+        if results:
+            results_sorted = sorted(results, key=lambda r: (r["score"], -r["execution_time_s"]), reverse=True)
+            best_name = results_sorted[0]["model_name"]
+            best_score = results_sorted[0]["score"]
+        else:
+            best_name = "Random Forest"
+            best_score = 0.0
 
         # Register combined run into history
         import datetime

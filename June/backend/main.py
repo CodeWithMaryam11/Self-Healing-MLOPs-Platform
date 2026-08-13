@@ -1,4 +1,6 @@
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["OMP_NUM_THREADS"] = "1"
 import io
 import pandas as pd
 from datetime import datetime, timedelta
@@ -119,20 +121,19 @@ async def register(user: RegisterRequest):
     result = await db.users.insert_one(new_user)
     
     # --- MLFLOW AUTH INTEGRATION ---
-    # Automatically create a matching user account in the MLflow Registry
+    # Automatically create a matching user account in the MLflow Registry if MLflow is running
+    import socket
     try:
-        from mlflow.server.auth.client import AuthServiceClient
-        import os
-        
-        # Authenticate as admin to create users
-        os.environ["MLFLOW_TRACKING_USERNAME"] = "admin"
-        os.environ["MLFLOW_TRACKING_PASSWORD"] = "password"
-        
-        auth_client = AuthServiceClient("http://localhost:5001")
-        auth_client.create_user(username=user.email, password=user.password)
-        print(f"MLflow user {user.email} created successfully.")
+        # Quick check if port 5001 is listening to avoid connection retry delays
+        with socket.create_connection(("localhost", 5001), timeout=0.5):
+            from mlflow.server.auth.client import AuthServiceClient
+            os.environ["MLFLOW_TRACKING_USERNAME"] = "admin"
+            os.environ["MLFLOW_TRACKING_PASSWORD"] = "password"
+            auth_client = AuthServiceClient("http://localhost:5001")
+            auth_client.create_user(username=user.email, password=user.password)
+            print(f"MLflow user {user.email} created successfully.")
     except Exception as e:
-        print(f"Failed to create MLflow user for {user.email}: {e}")
+        print(f"MLflow user creation skipped/failed: {e}")
         
     return {"message": "User registered successfully", "user_id": str(result.inserted_id)}
 
@@ -178,27 +179,49 @@ async def health_check():
 # ==========================================
 # AUTOML TRAINING & INGESTION DISPATCHER
 # ==========================================
+def generate_sample_dataset() -> pd.DataFrame:
+    from sklearn.datasets import make_classification
+    X, y = make_classification(n_samples=200, n_features=10, n_informative=8, random_state=42)
+    feature_names = [f"feature_{i}" for i in range(10)]
+    df = pd.DataFrame(X, columns=feature_names)
+    df["target"] = y
+    return df
+
 def background_training_task(dataset_name: str, models: list, target_metric: str, df_bytes: bytes, user_id: str):
+    # 1. Parse CSV bytes into DataFrame or generate sample dataset
+    df = None
+    if df_bytes and len(df_bytes) > 0:
+        try:
+            df = pd.read_csv(io.BytesIO(df_bytes))
+        except Exception as e:
+            print(f"[CSV Parsing Error] Failed to parse uploaded file: {e}")
+
+    if df is None or df.empty:
+        print("[Dataset Fallback] Using generated synthetic dataset.")
+        df = generate_sample_dataset()
+
+    # 2. Try optional MinIO Object Storage persistence if MinIO is active
+    if df_bytes and len(df_bytes) > 0:
+        try:
+            from storage import upload_dataset_to_s3
+            s3_key = upload_dataset_to_s3(user_id, dataset_name, df_bytes)
+            print(f"[Storage] Successfully uploaded to MinIO: {s3_key}")
+        except Exception as e:
+            print(f"[Storage Warning] MinIO storage unavailable (skipping S3 persist): {e}")
+
+    # Save local copy for drift monitoring
     try:
-        # Import the MinIO storage client
-        from storage import upload_dataset_to_s3
-        
-        # 1. Persist the uploaded dataset directly to MinIO Object Storage
-        # This securely isolates the tenant's data in the cloud instead of the local server disk
-        s3_key = upload_dataset_to_s3(user_id, dataset_name, df_bytes)
-        print(f"[Storage] Successfully uploaded to MinIO: {s3_key}")
-        
-        # 2. Read into memory for AutoML engine
-        df = pd.read_csv(io.BytesIO(df_bytes))
+        data_dir = os.path.join(os.path.dirname(__file__), "data")
+        os.makedirs(data_dir, exist_ok=True)
+        df.to_csv(os.path.join(data_dir, dataset_name), index=False)
     except Exception as e:
-        print(f"[Storage Error] Falling back to default dataset. Error: {e}")
-        default_path = os.path.join(os.path.dirname(__file__), "data", "ibm_hr_attrition.csv")
-        df = pd.read_csv(default_path)
-    
+        print(f"[Dataset Local Save Warning]: {e}")
+
+    # 3. Train models via ML Engine
     try:
         ml_engine.train_concurrent_models(dataset_name, models, target_metric, df, user_id)
-    except Exception:
-        # Self-healing fallback: if dataset is malformed, remove stuck Training... placeholder
+    except Exception as e:
+        print(f"[Training Error] Model training failed: {e}")
         from db import get_sync_db
         sync_db = get_sync_db()
         if sync_db is not None:
@@ -216,16 +239,12 @@ async def train_models(
     Layer 1 & Layer 2: Ingestion & Training Dispatcher
     Receives tabular dataset CSV, triggers SMOTE auto-balancing, and concurrently runs ML models.
     """
-    dataset_name = "ibm_hr_attrition.csv"
+    dataset_name = "uploaded_dataset.csv"
     df_bytes = b""
 
     if file:
         dataset_name = file.filename or dataset_name
         df_bytes = await file.read()
-    else:
-        default_path = os.path.join(os.path.dirname(__file__), "data", "ibm_hr_attrition.csv")
-        with open(default_path, "rb") as f:
-            df_bytes = f.read()
 
     # Create temporary active run placeholder in MongoDB
     temp_run_id = f"run_{dataset_name[:4]}_active"
@@ -284,7 +303,7 @@ async def inject_drift_endpoint(body: dict = None, user_id: str = Depends(get_cu
     db = get_db()
     cursor = db.runs.find({"user_id": user_id}).sort("created_at", -1)
     runs_history = await cursor.to_list(length=100)
-    return drift_engine.inject_drift(run_id=run_id, runs_history=runs_history)
+    return drift_engine.inject_drift(run_id=run_id, runs_history=runs_history, user_id=user_id)
 
 @app.post("/api/v1/drift/reset")
 async def reset_drift_endpoint(user_id: str = Depends(get_current_user)):

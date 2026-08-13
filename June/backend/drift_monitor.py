@@ -164,7 +164,8 @@ class DriftMonitorEngine:
                     df=df_payload,
                     user_id=u_id
                 )
-            except Exception:
+            except Exception as e:
+                print(f"[Self-Healing Worker Error]: {e}")
                 db_sync = get_sync_db()
                 if db_sync is not None:
                     db_sync.runs.delete_many({"user_id": u_id, "id": t_id})

@@ -33,7 +33,6 @@ export const TrainingSetup = () => {
       setStatusMsg(`Pipeline dispatched successfully. Job Reference: ${data.run_id}`);
       // Invalidate live runs cache to force immediate dashboard refresh
       queryClient.invalidateQueries({ queryKey: ['runs'] });
-      setFile(null);
     },
     onError: (err) => {
       setStatusMsg(`Pipeline fault: ${err.response?.data?.detail || err.message}`);

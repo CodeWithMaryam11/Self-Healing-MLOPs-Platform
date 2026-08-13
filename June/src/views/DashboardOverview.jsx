@@ -169,7 +169,7 @@ export const DashboardOverview = () => {
             </div>
           </div>
           <span className="text-[11px] font-bold text-blue-700 block text-right pt-4">
-            Evaluated on IBM HR Attrition Test Split (30% holdout)
+            Evaluated on {completedRuns.length > 0 ? completedRuns[0].dataset : 'Uploaded Dataset'} Test Split (20% holdout)
           </span>
         </div>
 

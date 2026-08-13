@@ -177,7 +177,7 @@ if (USE_MOCK) {
 
     // POST /models/train
     if (matchPath(url, '/models/train') && method === 'post') {
-      let datasetName = 'ibm_hr_attrition.csv';
+      let datasetName = 'uploaded_dataset.csv';
       let selectedModels = ['Random Forest', 'XGBoost', 'LightGBM'];
       let targetMetric = 'F1-Score';
 
